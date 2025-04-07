@@ -184,3 +184,7 @@ models/*
 # Logs
 logs/*
 !logs/.gitkeep
+
+# Wandb
+wandb/*
+!wandb/.gitkeep
