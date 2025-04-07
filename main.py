@@ -23,6 +23,10 @@ Key Updates:
 - Tokenization now uses a max input length of 8192 tokens and a max target length of 1024 tokens.
 - The model name has been updated to "Qwen/Qwen-0.5B-base".
 
+Additional Testing:
+After training, the model is evaluated on a test dataset.
+The predicted serialized returns are deserialized, and Mean Squared Error (MSE) is computed against the ground truth.
+WandB is used to log the test MSE and track error changes over time.
 """
 
 import argparse
@@ -30,6 +34,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, Seq2SeqTrainingArguments, Seq2SeqTrainer
+import wandb
 
 class QwenTimeSeriesDataset(Dataset):
     """
@@ -88,17 +93,31 @@ def tokenize_function(example, tokenizer, max_input_length=8192, max_target_leng
     model_inputs["labels"] = labels["input_ids"]
     return model_inputs
 
+def parse_returns(s: str):
+    """
+    Parse a serialized string of returns into a numpy array.
+    """
+    try:
+        return np.array([float(x) for x in s.split(";")])
+    except Exception:
+        return np.array([])
+
 def main():
     parser = argparse.ArgumentParser(description="Fine-tune Qwen-0.5B for time-series forecasting.")
-    parser.add_argument("--train_file", type=str, default="data/train.npz", help="Path to training data NPZ file")
-    parser.add_argument("--valid_file", type=str, default="data/valid.npz", help="Path to validation data NPZ file")
+    parser.add_argument("--train_file", type=str, default="data/Char_train.npz", help="Path to training data NPZ file")
+    parser.add_argument("--valid_file", type=str, default="data/Char_valid.npz", help="Path to validation data NPZ file")
+    parser.add_argument("--test_file", type=str, default="data/Char_test.npz", help="Path to test data NPZ file")
     parser.add_argument("--window_length", type=int, default=12, help="Window length to use for input sequence")
     parser.add_argument("--num_train_epochs", type=int, default=3, help="Number of training epochs")
     args = parser.parse_args()
+    
+    # Initialize WandB for logging error metrics over time.
+    wandb.init(project="qwen_timeseries", config=vars(args))
 
     # Create datasets
     train_dataset = QwenTimeSeriesDataset(args.train_file, args.window_length)
     valid_dataset = QwenTimeSeriesDataset(args.valid_file, args.window_length)
+    test_dataset = QwenTimeSeriesDataset(args.test_file, args.window_length)
 
     # Load Qwen model and tokenizer using the updated model name from the documentation
     model_name = "Qwen/Qwen-0.5B-base"
@@ -144,6 +163,25 @@ def main():
     trainer.train()
     # Save the final model
     trainer.save_model()
+
+    # Testing Part: Evaluate on test dataset and compute MSE over predictions.
+    test_results = trainer.predict(test_dataset)
+    decoded_preds = tokenizer.batch_decode(test_results.predictions, skip_special_tokens=True)
+    # Get ground truth targets from test dataset.
+    targets = [sample["target"] for sample in test_dataset]
+    mse_list = []
+    for pred, target in zip(decoded_preds, targets):
+        pred_values = parse_returns(pred)
+        target_values = parse_returns(target)
+        if pred_values.size != target_values.size or pred_values.size == 0:
+            continue
+        mse = np.mean((pred_values - target_values) ** 2)
+        mse_list.append(mse)
+    overall_mse = np.mean(mse_list) if mse_list else float("nan")
+    print("Test MSE:", overall_mse)
+    wandb.log({"test_mse": overall_mse})
+    
+    wandb.finish()
 
 if __name__ == "__main__":
     main()
