@@ -80,8 +80,20 @@ class QwenTimeSeriesDataset(Dataset):
         return {"prompt": prompt, "full_text": full_text, "target": target_serialized}
 
 def tokenize_function(example, tokenizer, max_length=8192):
-    tokenized = tokenizer(example["full_text"], truncation=True, max_length=max_length)
-    prompt_ids = tokenizer(example["prompt"], truncation=True, max_length=max_length)["input_ids"]
+    # Check if example is a dictionary (direct dataset access) or a tensor/string (from DataLoader)
+    if not isinstance(example, dict):
+        # If it's not a dictionary, we assume it's the full_text directly
+        full_text = example
+        # We can't easily get the prompt in this case, so we'll need to reconstruct it
+        prompt_end = full_text.find("\nReturn:") + len("\nReturn:")
+        prompt = full_text[:prompt_end]
+    else:
+        # Original case when example is a dictionary
+        full_text = example["full_text"]
+        prompt = example["prompt"]
+    
+    tokenized = tokenizer(full_text, truncation=True, max_length=max_length)
+    prompt_ids = tokenizer(prompt, truncation=True, max_length=max_length)["input_ids"]
     prompt_length = len(prompt_ids)
     labels = tokenized["input_ids"].copy()
     for i in range(prompt_length):
@@ -130,7 +142,13 @@ def main():
     parser.add_argument("--test_file", type=str, default="data/Char_test.npz", help="Path to test data NPZ file")
     parser.add_argument("--window_length", type=int, default=12, help="Window length to use for input sequence")
     parser.add_argument("--num_train_epochs", type=int, default=3, help="Number of training epochs")
+    parser.add_argument("--gpu_id", type=int, default=0, help="GPU ID to use (0, 1, or 2 for your 3 GPUs)")
     args = parser.parse_args()
+    
+    # Set specific GPU
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
     
     wandb.init(project="qwen_timeseries", config=vars(args))
     
@@ -147,10 +165,24 @@ def main():
         print("Setting pad_token to eos_token.")
         tokenizer.pad_token = tokenizer.eos_token
     model = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=True)
+    model.to(device)  # Move model to GPU immediately after loading
     print("Model and tokenizer loaded.")
     
     print("Tokenizing training dataset...")
-    train_tokenized = [tokenize_function(sample, tokenizer) for sample in tqdm(train_dataset, desc="Tokenizing train dataset")]
+    # Instead of using DataLoader, process one by one to maintain dictionary structure
+    train_tokenized = []
+    for sample in tqdm(train_dataset, desc="Tokenizing train dataset"):
+        train_tokenized.append(tokenize_function(sample, tokenizer))
+        
+        # Move processed data to GPU to start filling GPU memory
+        if len(train_tokenized) % 100 == 0:
+            # Convert some tokenized samples to tensors and move to GPU
+            # This prepares GPU memory for training
+            _ = [
+                {k: torch.tensor(v).to(device) if isinstance(v, list) else v 
+                 for k, v in sample.items()}
+                for sample in train_tokenized[-100:]
+            ]
     
     # Cache validation and test tokenized datasets
     cache_dir = "cache"
@@ -163,7 +195,9 @@ def main():
         valid_tokenized = pickle.load(open(valid_cache, "rb"))
     else:
         print("Tokenizing validation dataset...")
-        valid_tokenized = [tokenize_function(sample, tokenizer) for sample in tqdm(valid_dataset, desc="Tokenizing valid dataset")]
+        valid_tokenized = []
+        for sample in tqdm(valid_dataset, desc="Tokenizing valid dataset"):
+            valid_tokenized.append(tokenize_function(sample, tokenizer))
         pickle.dump(valid_tokenized, open(valid_cache, "wb"))
     
     if os.path.exists(test_cache):
@@ -200,13 +234,17 @@ def main():
         output_dir="./model",
         evaluation_strategy="steps",
         eval_steps=50,
-        per_device_train_batch_size=1,
-        per_device_eval_batch_size=1,
+        # Increase batch size to better utilize GPU
+        per_device_train_batch_size=4,  # Try higher values like 2, 4, or 8
+        per_device_eval_batch_size=4,
         num_train_epochs=args.num_train_epochs,
         save_steps=100,
         logging_steps=10,
         learning_rate=5e-5,
-        fp16=torch.cuda.is_available(),
+        fp16=True,  # Ensure this is enabled for GPU
+        dataloader_num_workers=4,  # Use multiple workers
+        dataloader_pin_memory=True,  # Pin memory for faster GPU transfer
+        gradient_accumulation_steps=4,  # Accumulate gradients for effective larger batch
         report_to="all",
         disable_tqdm=False
     )
