@@ -1,13 +1,12 @@
 import numpy as np
-import pandas as pd
 from datasets import Dataset
 from transformers import AutoTokenizer, AutoConfig
-from pandarallel import pandarallel
 import multiprocessing
 
 NUM_PROC = min(50, multiprocessing.cpu_count() - 1)
-CONTEXT_LENGTH = 30  # e.g., 30 months = 2.5 years
+CONTEXT_LENGTH = 30
 TARGET_VARIABLE = "ret"
+BATCH_SIZE = 10000
 
 
 def setup_tokenizer(model_name):
@@ -22,44 +21,39 @@ def load_npz_data(npz_path):
     return data["date"], data["variable"], data["data"]
 
 
-def create_sliding_windows(data_array, variables, context_length, target_var_idx):
+def sliding_window_generator(data_array, variables, context_length, target_var_idx):
     time_len, num_stocks, _ = data_array.shape
-    samples = []
     for t in range(context_length, time_len - 1):
-        X = data_array[
-            t - context_length : t
-        ]  # shape (context_length, num_stocks, vars)
-        y = data_array[t + 1, :, target_var_idx]  # next-step return for each stock
+        X = data_array[t - context_length : t]  # shape (context_len, num_stocks, vars)
+        y = data_array[t + 1, :, target_var_idx]  # shape (num_stocks,)
         for stock_idx in range(num_stocks):
             x_stock = X[:, stock_idx, :]
             y_stock = y[stock_idx]
-            samples.append(
-                {"features": x_stock.astype(np.float32), "label": float(y_stock)}
+            yield {
+                "features": x_stock.astype(np.float32),
+                "label": float(y_stock),
+            }
+
+
+def encode_windowed_batch(batch, tokenizer, variables):
+    input_texts = []
+    for features in batch["features"]:
+        time_steps, num_vars = features.shape
+        lines = []
+        for t in range(time_steps):
+            feature_line = " ".join(
+                f"{variables[v]}={features[t, v]:.5f}" for v in range(num_vars)
             )
-    return samples
-
-
-def encode_windowed_sample(sample, tokenizer, variables):
-    """
-    Converts a window of features into a structured string with time-step tagging
-    and tokenizes it. Label is kept as float target for next-step return.
-    """
-    time_steps, num_vars = sample["features"].shape
-    lines = []
-    for t in range(time_steps):
-        feature_line = " ".join(
-            f"{variables[v]}={sample['features'][t, v]:.5f}" for v in range(num_vars)
-        )
-        lines.append(f"<time={t}> {feature_line}")
-    input_str = " ".join(lines)
+            lines.append(f"<time={t}> {feature_line}")
+        input_texts.append(" ".join(lines))
 
     tokenized = tokenizer(
-        input_str,
+        input_texts,
         truncation=True,
         max_length=tokenizer.model_max_length,
         padding="max_length",
     )
-    tokenized["labels"] = [sample["label"]]
+    tokenized["labels"] = batch["label"]
     return tokenized
 
 
@@ -75,24 +69,22 @@ def tokenize_timeseries_data(
 
     if verbose:
         print(f"Loaded data shape: {data.shape}, target index: {target_var_idx}")
-        print("Creating sliding windows...")
+        print("Preparing streaming dataset...")
 
-    samples = create_sliding_windows(data, variables, context_length, target_var_idx)
-    df = pd.DataFrame(samples)
-
-    if verbose:
-        print(f"Generated {len(df)} samples")
-
-    pandarallel.initialize(nb_workers=NUM_PROC, verbose=1 if verbose else 0)
-    tokenized_df = df.parallel_apply(
-        lambda row: encode_windowed_sample(row, tokenizer, variables),
-        axis=1,
-        result_type="expand"
+    gen = lambda: sliding_window_generator(
+        data, variables, context_length, target_var_idx
     )
 
-    dataset = Dataset.from_pandas(tokenized_df)
+    raw_dataset = Dataset.from_generator(gen, cache_dir=None)
+    tokenized_dataset = raw_dataset.map(
+        lambda batch: encode_windowed_batch(batch, tokenizer, variables),
+        batched=True,
+        batch_size=BATCH_SIZE,
+        num_proc=NUM_PROC,
+        remove_columns=["features", "label"],
+    )
 
-    return dataset
+    return tokenized_dataset
 
 
 if __name__ == "__main__":
